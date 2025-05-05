@@ -1,0 +1,710 @@
+---
+title: "Final Dashboard : Dorling Cartogram of San Diego, California"
+output:
+  html_document:
+    theme: readable
+    highlight: tango
+    toc: true
+    self_contained: false
+    number_sections: false
+    css: textbook.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=T, fig.width=10, fig.height=6, warning=F, message=F )
+```
+
+
+```{r}
+library( geojsonio )   # read shapefiles
+library( sp )          # work with shapefiles
+library( sf )          # work with shapefiles - simple features format
+library( mclust )      # cluster analysis 
+library( tmap )        # theme maps
+library( ggplot2 )     # graphing 
+library( ggthemes )    # nice formats for ggplots
+library( dplyr )       # data wrangling 
+library( pander )      # formatting RMD tables
+library( stargazer )
+library( scales )
+library( tidycensus )
+library( cartogram )  # spatial maps w/ tract size bias reduction
+#library( maptools )   # spatial object manipulation 
+library( corrplot )   # correlation plots 
+```
+
+
+```{r}
+crosswalk <- read.csv( "https://raw.githubusercontent.com/DS4PS/cpp-529-master/master/data/cbsatocountycrosswalk.csv",  stringsAsFactors=F, colClasses="character" )
+
+grep( "^SAN DIEGO", crosswalk$msaname, value=TRUE ) 
+```
+
+
+```{r}
+these.sd <- 
+  crosswalk$msaname == grep( "^SAN DIEGO", crosswalk$msaname, value=TRUE ) 
+
+these.fips <- crosswalk$fipscounty[ these.sd ]
+these.fips <- na.omit( these.fips )
+```
+
+
+```{r}
+# set the api key
+census_api_key( "1f6f30cb3efe7bd63a29c29429a5880a38e002d7" )
+
+# Filter for San Diego County
+these.fips <- "06073"
+
+state.fips <- substr( these.fips, 1, 2 )
+county.fips <- substr( these.fips, 3, 5 )
+
+cbind( these.fips, state.fips, county.fips ) %>% pander()
+```
+
+```{r}
+#May need to install and load in pak
+#pak::pak("walkerke/tigris@ftp-patch")
+
+
+sd.pop <- get_acs( geography = "tract", variables = "B01003_001",
+         state = "06", county = "073", geometry = TRUE ) %>% 
+         select( GEOID, estimate ) %>%
+         rename( POP=estimate )
+# Recode GEOID to match Census formatting (remove leading zero)
+
+sd.pop$GEOID <- substr(sd.pop$GEOID, 2, nchar(sd.pop$GEOID))
+
+# Save the dataframe 'sd.pop' to an RData file:
+#save(sd.pop, file = "sd.pop.RData")
+```
+
+**Step 3: Add Census Data **
+
+Here, we use specific data stored in the github URl with multiple variables associated.
+
+```{r}
+URL <- "https://github.com/DS4PS/cpp-529-master/raw/master/data/ltdb_std_2010_sample.rds"
+census.dat <- readRDS(gzcon(url( URL )))
+```
+
+**Step 4: Transforming Shapefile into a Dorling Cartogram**
+
+```{r}
+# Merge the downloaded population data with the additional data
+sd <- merge(sd.pop, census.dat, by.x="GEOID", by.y="tractid")
+
+# make sure there are no empty polygons
+sd <- sd[ ! st_is_empty( sd ) , ]
+
+# Convert the simple features object (sf) to SpatialPolygonsDataFrame (sp)
+sd.sp <- as_Spatial(sd)
+
+# Check the class of the object to confirm conversion
+class(sd.sp)
+# Plot spatial data to visually inspect it
+plot(sd.sp)
+```
+
+
+```{r}
+# Transform map projection to Mercator (EPSG:3395) and remove empty or zero population tracts
+sd.sp <- spTransform(sd.sp, CRS("+init=epsg:3395"))
+sd.sp <- sd.sp[sd.sp$POP != 0 & (!is.na(sd.sp$POP)), ]
+
+# Create Dorling cartogram (circles sized by population)
+# Weight (pop.w) is normalized by the maximum population
+sd.sp$pop.w <- sd.sp$POP / 38907  # normalization factor
+sd_dorling <- cartogram_dorling(x = sd.sp, weight = "pop.w", k = 0.05)
+
+# Save Dorling cartogram to GeoJSON file (optional)
+# geojson_write(sd_dorling, file = "San_Diego.geojson", geometry = "polygon")
+plot( sd_dorling )
+```
+
+
+```{r}
+sd_dorling_sf <- st_as_sf(sd_dorling)
+
+tm_shape( sd_dorling_sf ) + 
+  tm_polygons( 
+    size="POP", col="hinc12", n=7, style="quantile", palette="Spectral" ) + 
+   tm_layout( "Dorling Cartogram \nof Household Income \nfor San Diego", 
+              title.position=c( "right","top" ) )
+```
+
+```{r}
+names(sd)
+```
+
+
+**Step 5 : Prepare Data for Clustering**
+
+```{r}
+these.sd <- c("pnhwht12", "pnhblk12", "phisp12", "pntv12", "pfb12", "polang12",  
+"phs12", "pcol12", "punemp12", "pflabf12", "pprof12", "pmanuf12", 
+"pvet12", "psemp12", "hinc12", "incpc12", "ppov12", "pown12", 
+"pvac12", "pmulti12", "mrent12", "mhmval12", "p30old12", "p10yrs12", 
+"p18und12", "p60up12", "p75up12", "pmar12", "pwds12", "pfhh12")
+
+d1 <- sd_dorling@data
+d2 <- select( d1, these.sd )
+d3 <- apply( d2, 2, scale )
+
+```
+
+**Step 6: Apply K-means Clustering**
+
+```{r}
+set.seed( 1234 )
+fit <- Mclust( d3 )
+sd_dorling_sf$cluster <- as.factor( fit$classification )
+summary( fit )
+```
+
+```{r}
+plot( fit, what = "classification" )
+```
+
+**Step 7: Visualize and Interpret the Clusters**
+
+```{r}
+data.dictionary <- 
+structure( 
+  list( 
+    LABEL = c( "pnhwht12", "pnhblk12", "phisp12", 
+               "pntv12", "pfb12", "polang12", "phs12", "pcol12", "punemp12", 
+               "pflabf12", "pprof12", "pmanuf12", "pvet12", "psemp12", "hinc12", 
+               "incpc12", "ppov12", "pown12", "pvac12", "pmulti12", "mrent12", 
+               "mhmval12", "p30old12", "p10yrs12", "p18und12", 
+               "p60up12", "p75up12", "pmar12", "pwds12", "pfhh12" ), 
+    VARIABLE = c( "Percent white, non-Hispanic", 
+                 "Percent black, non-Hispanic", "Percent Hispanic", 
+                 "Percent Native American race", "Percent foreign born", 
+                 "Percent speaking other language at home, age 5 plus", 
+                 "Percent with high school degree or less", 
+                 "Percent with 4-year college degree or more", 
+                 "Percent unemployed", "Percent female labor force participation", 
+                 "Percent professional employees", 
+                 "Percent manufacturing employees", 
+                 "Percent veteran", "Percent self-employed", 
+                 "Median HH income, total", "Per capita income", 
+                 "Percent in poverty, total", "Percent owner-occupied units", 
+                 "Percent vacant units", "Percent multi-family units", 
+                 "Median rent", "Median home value", 
+                 "Percent structures more than 30 years old",
+                 "Percent HH in neighborhood 10 years or less", 
+                 "Percent 17 and under, total", "Percent 60 and older, total",
+                 "Percent 75 and older, total", 
+                 "Percent currently married, not separated", 
+                 "Percent widowed, divorced and separated", 
+                 "Percent female-headed families with children" ) ), 
+  class = "data.frame", row.names = c( NA, -30L ) )
+data.dictionary %>% pander()
+```
+
+
+```{r}
+df.pct <- sapply( d2, ntile, 100 )
+d4 <- as.data.frame( df.pct )
+d4$cluster <- as.factor( paste0("GROUP-",fit$classification) )
+
+num.groups <- length( unique( fit$classification ) )
+
+stats <- 
+d4 %>% 
+  group_by( cluster ) %>% 
+  summarise_each( funs( mean ) )
+
+t <- data.frame( t( stats ), stringsAsFactors=FALSE )
+names( t ) <- paste0( "GROUP.", 1:num.groups )
+t <- t[-1,]
+
+
+for( i in 1:num.groups )
+{
+  z <- t[,i]
+  plot( rep(1,30), 1:30, bty="n", xlim=c(-75,100), 
+        type="n", xaxt="n", yaxt="n",
+        xlab="Percentile", ylab="",
+        main=paste( "GROUP",i ) )
+  abline( v=seq( 0, 100, 25 ), lty=3, lwd=1.5, col="gray90" )
+  segments( y0=1:30, x0=0, x1=100, col="gray70", lwd=2 )
+  text( -0.2, 1:30, data.dictionary$VARIABLE, cex=0.85, pos=2 )
+  points( z, 1:30, pch=19, col="firebrick", cex=1.5 )
+  axis( side=1, at=c( 0,50,100 ), col.axis="gray", col="gray" )
+}
+```
+
+The labels for the groups are:
+
+Group 1-White and native American/Veteran/Self employed;
+
+Group 2-Multi-family/Educated/Active females;
+
+Group 3-Non-white, unemployed minorities;
+
+Group 4-Older affluent white/Stable Families;
+
+Group 5-Foreign-born/Multilingual/Feminist;
+
+Group 6-Mixed-race high income employees/high home value.
+
+```{r}
+# libraries
+library( dplyr )
+library( knitr )
+library( pander )
+library( stargazer )
+library( scales )
+
+
+# set seed for reproducible results
+set.seed( 1234 )
+
+
+# stargazer settings
+s.type <- "text"  
+#s.type <- "html"
+
+
+# helper function
+panel.cor <- function(x, y, digits=2, prefix="", cex.cor)
+{
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- abs(cor(x, y))
+    txt <- format(c(r, 0.123456789), digits=digits)[1]
+    txt <- paste(prefix, txt, sep="")
+    if(missing(cex.cor)) cex <- 0.8/strwidth(txt)
+    
+    test <- cor.test(x,y)
+    # borrowed from printCoefmat
+    Signif <- symnum(test$p.value, corr = FALSE, na = FALSE,
+                  cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                  symbols = c("***", "**", "*", ".", " "))
+    
+    text(0.5, 0.5, txt, cex = 1.5 )
+    text(.7, .8, Signif, cex=cex, col=2)
+}
+
+panel.smooth <- function (x, y, col = par("col"), bg = NA, pch = par("pch"), 
+    cex = 0.5, col.smooth = "red", span = 2/3, iter = 3, ...) 
+{
+    points(x, y, pch = 19, col = gray(0.7,0.2), bg = bg, cex = cex)
+    ok <- is.finite(x) & is.finite(y)
+    if (any(ok)) 
+        lines(stats::lowess(x[ok], y[ok], f = span, iter = iter), 
+            col = col.smooth, lwd=2, ...)
+}
+
+# custom plot
+jplot <- function( x1, x2, lab1="", lab2="", draw.line=T, ... )
+{
+
+    plot( x1, x2,
+          pch=19, 
+          col=gray(0.6, alpha = 0.2), 
+          cex=0.5,  
+          bty = "n",
+          xlab=lab1, 
+          ylab=lab2, cex.lab=1.5,
+        ... )
+
+    if( draw.line==T ){ 
+        ok <- is.finite(x1) & is.finite(x2)
+        lines( lowess(x2[ok]~x1[ok]), col="red", lwd=3 ) }
+
+}
+```
+
+
+```{r}
+URL1 <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-2000.rds"
+d1 <- readRDS( gzcon( url( URL1 ) ) )
+
+URL2 <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-2010.rds"
+d2 <- readRDS( gzcon( url( URL2 ) ) )
+
+URLmd <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-META-DATA.rds"
+md <- readRDS( gzcon( url( URLmd ) ) )
+
+d1 <- select( d1, - year )
+d2 <- select( d2, - year )
+
+d <- merge( d1, d2, by="tractid" )
+d <- merge( d, md, by="tractid" )
+```
+
+
+```{r, eval=FALSE}
+table( d$urban )
+```
+
+```{r}
+d <- filter( d, urban == "urban" )
+```
+
+```{r}
+d <- select( d, tractid, 
+             mhmval00, mhmval12, 
+             unemp00, clf00,
+             vac00,hu00,
+             npov00, dpov00,
+             cbsa, cbsaname )
+
+d <- 
+  d %>%
+  mutate( p.unemp = 100 * unemp00 / clf00,
+          p.vacant = 100 * vac00 / hu00,
+          pov.rate = 100 * npov00 / dpov00 )
+```
+
+**Create growth of median home value from 2000 to 2010**
+
+```{r}
+# Adjust 2000 home values for inflation 
+mhv.00 <- d$mhmval00 * 1.28855  
+mhv.10 <- d$mhmval12
+
+# Change in MHV in dollars
+mhv.change <- mhv.10 - mhv.00
+```
+
+**Omit cases that have a median home value less than $1,000 in 2000**
+```{r}
+d <- select( d, tractid, 
+             mhmval00, mhmval12, 
+             hinc00, 
+             hu00, vac00, own00, rent00, h30old00,
+             empclf00, clf00, unemp00, prof00,  
+             dpov00, npov00,
+             ag25up00, hs00, col00, 
+             pop00.x, nhwht00, nhblk00, hisp00, asian00,
+             cbsa, cbsaname )
+d <- d %>%
+  mutate( # percent white in 2000
+          p.white = 100 * nhwht00 / pop00.x,
+          # percent black in 2000
+          p.black = 100 * nhblk00 / pop00.x,
+          # percent hispanic in 2000
+          p.hisp = 100 * hisp00 / pop00.x, 
+          # percent owner-occupied units
+          p.own = 100 * own00 / hu00,
+          # percent asian in 2000
+          p.asian = 100 * asian00 / pop00.x,
+          # percent high school grads by age 25 in 2000 
+          p.hs = 100 * (hs00+col00) / ag25up00,
+          # percent pop with college degree in 2000
+          p.col = 100 * col00 / ag25up00,
+          # percent employed in professional fields in 2000
+          p.prof = 100 * prof00 / empclf00,
+          # percent unemployment  in 2000
+          p.unemp = 100 * unemp00 / clf00,
+          # percent of housing lots in tract that are vacant in 2000
+          p.vacant = 100 * vac00 / hu00,
+          # dollar change in median home value 2000 to 2010 
+          pov.rate = 100 * npov00 / dpov00 )
+
+
+# adjust 2000 home values for inflation 
+mhv.00 <- d$mhmval00 * 1.28855  
+mhv.10 <- d$mhmval12
+
+# change in MHV in dollars
+mhv.change <- mhv.10 - mhv.00
+
+
+# drop low 2000 median home values
+# to avoid unrealistic growth rates.
+#
+# tracts with homes that cost less than
+# $1,000 are outliers
+mhv.00[ mhv.00 < 1000 ] <- NA
+
+# change in MHV in percent
+mhv.growth <- 100 * ( mhv.change / mhv.00 )
+
+d$mhv.00 <- mhv.00
+d$mhv.10 <- mhv.10
+d$mhv.change <- mhv.change
+d$mhv.growth <- mhv.growth
+
+# Average growth in median home value for the city
+d <- 
+  d %>%
+  group_by( cbsaname ) %>%
+  mutate( metro.mhv.change = median( mhv.change, na.rm=T ),
+             metro.mhv.growth = 100 * median( mhv.growth, na.rm=T ) ) %>%
+  ungroup() 
+```
+
+
+**Print summary statistics**
+```{r}
+# Histograms
+# 2000
+hist( mhv.00, breaks=200, xlim=c(0,500000), 
+      col="gray20", border="white",
+      axes=F, 
+      xlab="MHV",
+      ylab="",
+      main="Median Home Value in 2000 (2010 US dollars)" )
+
+axis( side=1, at=seq(0,500000,100000), 
+      labels=c("$0","$100k","$200k","$300k","$400k","$500k") )
+
+abline( v=median( mhv.00, na.rm=T ), col="orange", lwd=3 )
+```
+
+```{r}
+# 2010
+hist( mhv.10, breaks=200, xlim=c( 0, max( mhv.10, na.rm = TRUE ) ), 
+      col="gray20", border="white",
+      axes=F, 
+      xlab="MHV",
+      ylab="",
+      main="Median Home Value in 2010" )
+
+axis( side=1, at=seq(0,1000000,250000), 
+      labels=c("$0","$250k","$500k","$750k","$1mil") )
+
+abline( v=median( mhv.10, na.rm=T ), col="lightblue", lwd=3 )
+```
+
+**Descriptives**
+```{r}
+df <- data.frame( MedianHomeValue2000=mhv.00, 
+                  MedianHomeValue2010=mhv.10, 
+                  MHV.Change.00.to.10=mhv.change,
+                  MHV.Growth.00.to.12=mhv.growth )
+
+stargazer( df, 
+           type=s.type, 
+           digits=0, 
+           summary.stat = c("min", "p25","median","mean","p75","max") )
+```
+
+**Change in MHV 2000-2010**
+```{r}
+hist( mhv.change/1000, breaks=500, 
+      xlim=c(-100,500), yaxt="n", xaxt="n",
+      xlab="Thousand of US Dollars (adjusted to 2010)", cex.lab=1.5,
+      ylab="", main="Change in Median Home Value 2000 to 2010",
+      col="gray20", border="white" )
+
+axis( side=1, at=seq( from=-100, to=500, by=100 ), 
+      labels=paste0( "$", seq( from=-100, to=500, by=100 ), "k" ) )
+        
+mean.x <- mean( mhv.change/1000, na.rm=T )
+abline( v=mean.x, col="darkorange", lwd=2, lty=2 )
+text( x=200, y=1500, 
+      labels=paste0( "Mean = ", dollar( round(1000*mean.x,0)) ), 
+      col="darkorange", cex=1.8, pos=3 )
+
+median.x <- median( mhv.change/1000, na.rm=T )
+abline( v=median.x, col="dodgerblue", lwd=2, lty=2 )
+text( x=200, y=2000, 
+      labels=paste0( "Median = ", dollar( round(1000*median.x,0)) ), 
+      col="dodgerblue", cex=1.8, pos=3 )
+```
+
+**Percent change in MHV 2000 to 2010**
+```{r}
+hg <-
+hist( mhv.growth, breaks=5000, 
+      xlim=c(-100,200), yaxt="n", xaxt="n",
+      xlab="", cex.main=1.5,
+      ylab="", main="Growth in Home Value by Census Tract 2000 to 2010",
+      col="gray40" )
+
+axis( side=1, at=seq( from=-100, to=200, by=50 ), 
+      labels=paste0( seq( from=-100, to=200, by=50 ), "%" ) )
+
+ymax <- max( hg$count )
+        
+mean.x <- mean( mhv.growth, na.rm=T )
+abline( v=mean.x, col="firebrick", lwd=2, lty=2 )
+text( x=75, y=(0.5*ymax), 
+      labels=paste0( "Mean = ", round(mean.x,0), "%"), 
+      col="firebrick", cex=1.2, pos=4 )
+
+median.x <- median( mhv.growth, na.rm=T )
+abline( v=median.x, col="darkgreen", lwd=2, lty=2 )
+text( x=75, y=(0.6*ymax), 
+      labels=paste0( "Median = ", round(median.x,0), "%"), 
+      col="darkgreen", cex=1.2, pos=4 )
+```
+**Part 01 : Select three Independent Variables**
+
+For this exercise, I selected :
+
+**-Household Income in the tract. Areas with higher household incomes will be more attractive to buyers and will drive home prices up** 
+**-Percent College-Educated Residents. More educated residents provides ease for employment and job security resulting in availability of income for home purchase. As a result drive home prices up.**
+**-An increase in owner-occupied units is proof of proper maintenance of residences thus maintaining prices at a stable rate**
+
+**Part 02 : Variable Skew**
+
+```{r}
+par( mfrow=c( 2,2 ) )
+
+hist( d$p.own, xlim = c(0,80), breaks=50, col="blue", border="white",
+      yaxt="n", xlab="", ylab="", main="Percent Owner-Occupied Units")
+hist( d$p.col, xlim = c(0,80), breaks=50, col="red", border="white",
+      yaxt="n", xlab="", ylab="", main="Percentage of College-Educated Residents")
+hist( d$hinc00, xlim = c(0,200000), breaks=50, col="gray20", border="white",
+      yaxt="n", xlab="", ylab="", main="Household Income Distribution")
+```
+
+**Based on the histogram, we note left and right variable skew for owner-occupied units and college-educated residents respectively.Household Income appears to be uniformly distributed. However, we carry out a log transformation for all the variables.** 
+
+```{r}
+# transform the variables
+d$log.p.own  <- log( d$p.own + 1  )
+d$log.p.col <- log( d$p.col + 1 )
+d$log.hinc00 <- log( d$hinc00 + 1 )
+
+# examine the distribution
+par( mfrow=c( 3,2 ) )
+
+hist( d$p.own, xlim = c(0,80), breaks=50, col="blue", border="white",
+      yaxt="n", xlab="", ylab="", main="Percent Owner-Occupied Units")
+hist( d$log.p.own, breaks=50, col="blue", border="white",
+      yaxt="n", xlab="", ylab="", main="Percent Owner-Occupied Units (logged)")
+hist( d$p.col, xlim = c(0,80), breaks=50, col="red", border="white",
+      yaxt="n", xlab="", ylab="", main="Percentage of College-Educated Residents")
+hist( d$log.p.col, breaks=50, col="red", border="white",
+      yaxt="n", xlab="", ylab="", main="Percentage of College-Educated Residents (logged)")
+hist( d$hinc00, xlim = c(0,200000), breaks=50, col="gray20", border="white",
+      yaxt="n", xlab="", ylab="", main="Household Income Distribution")
+hist( d$log.hinc00, breaks=50, col="gray20", border="white",
+      yaxt="n", xlab="", ylab="", main="Household Income Distribution (logged)")
+```
+
+**Part 03 : Multicollinearity**
+
+```{r}
+# grab the variables we want
+plotd <- d %>% 
+  select( mhv.growth, log.p.own, log.p.col, log.hinc00 )
+
+set.seed( 1234 )
+plotd <- sample_n( plotd, 5000 ) %>% 
+  na.omit()
+
+# plot the data and show the correlations
+pairs( plotd, upper.panel=panel.cor, lower.panel=panel.smooth )
+```
+
+**Part 4 : Relationship of Home values with Predictors**
+
+```{r}
+par( mfrow = c( 2,2 ) )
+
+jplot( plotd$log.p.own, plotd$mhv.growth, ylim=c( -50,100 ),
+       lab1="Percent Owner-Occupied Units (logged)", lab2="MHV Growth" )
+
+jplot( plotd$log.p.col, plotd$mhv.growth, ylim=c( -50,100 ),
+       lab1="Percentage of College-Educated Residents (logged)", lab2="MHV Growth" )
+
+jplot( plotd$log.hinc00, plotd$mhv.growth, ylim=c( -50,100 ),
+       lab1="Household Income Distribution (logged)", lab2="MHV Growth" )
+```
+**Part 4: Descriptives**
+
+```{r}
+df <- data.frame( MedianHomeValue2000=d$mhv.00, 
+                  MedianHomeValue2010=d$mhv.10, 
+                  MHV.Change.00.to.10=d$mhv.change,
+                  MHV.Growth.00.to.12=d$mhv.growth,
+                  OwnLog2000=d$log.p.own,
+                  ColLog2000=d$log.p.col,
+                  HincLog2000=d$log.hinc00 )
+
+stargazer( df, 
+           type=s.type, 
+           digits=0, 
+           summary.stat = c("min", "p25","median","mean","p75","max") )
+```
+
+**The typical change in home value between 2000 and 2010 is 60,047. The largest change in home value between 2000 and 2010 is 1,000,001.**
+
+```{r}
+jplot( df$MHV.Change.00.to.10, df$MHV.Growth.00.to.12, ylim=c( -50,100 ),
+       lab1="MHV Change", lab2="MHV Growth" )
+```
+
+**Part 05 : Models**
+
+```{r}
+m1<-lm( MHV.Change.00.to.10 ~ OwnLog2000 + ColLog2000 + HincLog2000, data=df )
+
+m2<-lm( MHV.Growth.00.to.12 ~ OwnLog2000 + ColLog2000 + HincLog2000, data=df )
+
+
+stargazer( m1, m2, 
+           type=s.type, digits=2,
+           omit.stat = c( "rsq","f" ) )
+```
+**All the 03 (three) variables are significant predictors in our models. The regression table indicate that for both change in median house value and growth in median house value:**
+
+**-lower owner-occupancy in 2000 led to decreased change/growth in median house value between 2000 and 2010;**
+
+**-higher household incomes in 2000 led to increased change/growth in median house value between 2000 and 2010;**
+
+**-higher college-educated residents in 2000 led to an increase change in median house value between 2000 and 2010, and simultaneously a decrease growth in median home values between 2000 and 2010.**
+
+**Of these three variables, owner-occupied units had the largest effect for change in median house value and household incomes had the largest effect for median home value and growth in median home values.**
+
+
+**Part 6 : Effect Size**
+
+```{r}
+predictors <- cbind( 
+  df$OwnLog2000, df$ColLog2000, df$HincLog2000 )
+
+x.75 <- NULL
+x.25 <- NULL
+
+for ( i in 1:3 ){
+x.75[i] <- quantile( predictors[,i], p=0.75, na.rm = TRUE )  
+x.25[i] <- quantile( predictors[,i], p=0.25, na.rm = TRUE )  
+}
+
+beta.x.m1 <- m1$coefficients[2:4]
+beta.x.m2 <- m2$coefficients[2:4]
+
+effect.size.x.m1 <- ( x.75 - x.25 ) * beta.x.m1 
+effect.size.x.m2 <- ( x.75 - x.25 ) * beta.x.m2 
+```
+
+```{r}
+# WRITE TO FILE 
+
+library( geojsonio )
+
+sd_dorling <- spTransform( sd_dorling, CRS("+proj=longlat +datum=WGS84") )
+geojson_write( sd_dorling, file="sd_dorling.geojson", geometry="polygon" )
+```
+```{r}
+# Convert to sf object if needed
+sd_dorling_sf <- st_as_sf(sd_dorling)
+
+# Save as GeoJSON
+library(geojsonio)
+geojson_write(sd_dorling_sf, file = "sd_dorling.geojson")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
